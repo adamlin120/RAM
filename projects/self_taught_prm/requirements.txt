@@ -7,3 +7,4 @@ pylatexenc
 fsspec
 huggingface-hub
 ruff
+pre-commit

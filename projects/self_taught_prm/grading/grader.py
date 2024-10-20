@@ -1,4 +1,6 @@
 # from https://raw.githubusercontent.com/openai/prm800k/refs/heads/main/prm800k/grading/grader.py
+# ignore ruff E722
+# ruff: noqa: E722
 """
 Answer checker API that uses sympy to simplify expressions and check for equality.
 
@@ -144,7 +146,7 @@ def _normalize(expr: str) -> str:
         "yard",
     ]:
         expr = re.sub(f"{unit}(es)?(s)? *(\^[0-9]+)?", "", expr)
-    expr = re.sub(f"\^ *\\\\circ", "", expr)
+    expr = re.sub("\^ *\\\\circ", "", expr)
 
     if len(expr) > 0 and expr[0] == "{" and expr[-1] == "}":
         expr = expr[1:-1]

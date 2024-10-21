@@ -7,18 +7,22 @@ Dan Hendrycks, Collin Burns, Saurav Kadavath, Akul Arora, Steven Basart, Eric Ta
 https://arxiv.org/abs/2103.03874
 """
 
-import os
+
 import argparse
-from openai import OpenAI
-
-import random
-from typing import Literal, Callable, List, Dict
-
-import pandas as pd
-from tqdm import tqdm
+import heapq
 import logging
+import os
+import random
+import textwrap
+from typing import Callable, Dict, List, Literal
+
 import jinja2
+import pandas as pd
 from grading.grader import grade_answer
+from openai import OpenAI
+from termcolor import colored
+from tqdm import tqdm
+from transformers import AutoTokenizer
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -159,6 +163,25 @@ Respond with only "Yes" or "No" (without quotes). Do not include a rationale.
     Expression 2: %(expression2)s
 """.strip()
 
+STEP_VERIFICATION_PROMPT = jinja2.Template(
+    textwrap.dedent(
+        """
+Given the problem and the partial solution, verify that the last step is correct.
+
+Problem: {{ Question }}
+
+Partial solution: {{ steps }}
+
+FIRST RESPOND with "Yes" if the last step is correct or benefits the progress towards the solution, "No" otherwise.
+THEN EXPLAIN why you chose "Yes" or "No" in 4 sentences or less.
+
+For example:
+"Yes, because ..."
+"No, because ..."
+""".strip()
+    )
+)
+
 
 def check_equality(
     equality_checker: Callable[[List[Dict[str, str]]], str], expr1: str, expr2: str
@@ -168,6 +191,95 @@ def check_equality(
     response = equality_checker([dict(content=prompt, role="user")])
     logger.debug(f"Equality check response: {response}")
     return response.lower().strip() == "yes"
+
+
+class ProcessGuidedLLM:
+    def __init__(self, client: OpenAI, beam_width: int = 3, model: str = "gpt-4o-mini"):
+        self.client = client
+        self.verifier = OpenAI()
+        self.verifier_model = "gpt-4o-mini"
+        self.beam_width = beam_width
+        self.model = model  # Add this line
+        self.tokenizer = AutoTokenizer.from_pretrained(self.model)
+
+    def verify_step(self, question: str, steps: str) -> bool:
+        prompt = STEP_VERIFICATION_PROMPT.render(Question=question, steps=steps)
+        response = (
+            self.verifier.chat.completions.create(
+                model=self.verifier_model,
+                messages=[{"content": prompt, "role": "user"}],
+            )
+            .choices[0]
+            .message.content
+        )
+        return response.strip().lower().startswith("yes")
+
+    def __call__(
+        self,
+        prompt_messages: List[Dict[str, str]],
+        num_generations: int = 4,
+        max_steps: int = 50,
+    ) -> str:
+        beams = [
+            ([], 0, False)
+        ]  # Each beam is a tuple of (steps_list, score, is_finished)
+        for step_idx in range(1, max_steps + 1):
+            all_candidates = []
+            for steps, score, is_finished in beams:
+                if is_finished:
+                    # Beam is finished, carry it over
+                    all_candidates.append((steps, score, True))
+                    continue
+                # Generate num_generations responses for the current beam
+                if steps:
+                    formatted_prompt = self.tokenizer.apply_chat_template(
+                        prompt_messages
+                        + [
+                            {"role": "assistant", "content": "\n\n".join(steps).strip()}
+                        ],
+                        tokenize=False,
+                        add_generation_prompt=False,
+                        continue_final_message=True,
+                    )
+                else:
+                    formatted_prompt = self.tokenizer.apply_chat_template(
+                        prompt_messages, tokenize=False, add_generation_prompt=True
+                    )
+                # print(formatted_prompt)
+                responses = self.client.completions.create(
+                    model=self.model,
+                    prompt=formatted_prompt,
+                    temperature=0.7,
+                    top_p=0.95,
+                    stop=[f"## Step {step_idx + 1}"],
+                    n=num_generations,
+                )
+                generated_steps = [choice.text.strip() for choice in responses.choices]
+                for step in generated_steps:
+                    new_steps = steps + [step]
+                    if self.verify_step(
+                        prompt_messages[0]["content"], "\n".join(new_steps)
+                    ):
+                        # Check if 'final answer' is in the step
+                        if "final answer" in step.lower():
+                            # Beam is finished
+                            all_candidates.append((new_steps, score + 1, True))
+                            print(colored(step, "green"))
+                        else:
+                            all_candidates.append((new_steps, score + 1, False))
+                            print(colored(step, "green"))
+                    else:
+                        print(colored(step, "red"))
+            if not all_candidates:
+                break  # No valid candidates, terminate early
+            # Select top beam_width beams based on score
+            beams = heapq.nlargest(self.beam_width, all_candidates, key=lambda x: x[1])
+            # Check if all beams are finished
+            if all(is_finished for (_, _, is_finished) in beams):
+                break  # All beams finished, terminate early
+        # Select the beam with the highest score
+        best_steps, _, _ = beams[0]
+        return "\n\n".join(best_steps)
 
 
 class MathEval:
@@ -249,12 +361,53 @@ class MathEval:
             prompt_messages = [dict(content=content, role="user")]
             logger.debug(f"Problem prompt: {prompt_messages}")
             response_text = sampler(prompt_messages)
+            steps = [
+                step.strip() for step in response_text.split("## Step") if step.strip()
+            ]
+            # using 4o-mini to verify steps are correct
+            gpt4o_client = OpenAI()
+
+            def gpt4o_mini_sampler(question: str, steps: str) -> str:
+
+                return (
+                    gpt4o_client.chat.completions.create(
+                        model="gpt-4o-mini",
+                        messages=[
+                            dict(
+                                content=STEP_VERIFICATION_PROMPT.render(
+                                    Question=question, steps=steps
+                                ),
+                                role="user",
+                            )
+                        ],
+                    )
+                    .choices[0]
+                    .message.content
+                )
+
+            # for i, step in enumerate(steps):
+            #     verified_text = gpt4o_mini_sampler(row["Question"], "\n\n".join(steps[:i+1]))
+            #     if verified_text.strip().lower().startswith("yes"):
+            #         print(f"\033[92mStep: {step}\033[0m")  # Green for correct step
+            #         print(f"\033[92mStep verified response: {verified_text}\033[0m")
+            #         print("\033[92m✓ Correct\033[0m")
+            #     elif verified_text.strip().lower().startswith("no"):
+            #         print(f"\033[91mStep: {step}\033[0m")  # Red for incorrect step
+            #         print(f"\033[91mStep verified response: {verified_text}\033[0m")
+            #         print("\033[91m✗ Incorrect\033[0m")
+            #     else:
+            #         print(f"\033[93mStep: {step}\033[0m")  # Yellow for uncertain step
+            #         print(f"\033[93mStep verified response: {verified_text}\033[0m")
+            #         print("\033[93m? Uncertain\033[0m")
             logger.debug(f"Problem response: {response_text}")
             # match = re.search(ANSWER_PATTERN, response_text)
             extracted_answer = extract_result_from_boxed(
                 response_text
             )  # TODO: this is a hack to get llama3 working
             logger.debug(f"Extracted answer: {extracted_answer}")
+            import ipdb
+
+            ipdb.set_trace()
             if self.equality_checker:
                 score = float(
                     check_equality(
@@ -263,11 +416,15 @@ class MathEval:
                 )
             else:
                 score = float(grade_answer(extracted_answer, row["Answer"]))
-            # print(f"Response text: {response_text[-100:]}")
-            # print(f"Extracted answer: {extracted_answer}")
-            # print(f"Correct answer: {row['Answer']}")
-            # print(f"Score: {score}")
-            # print(f"Correct: {'CORRECT' if score == 1.0 else 'INCORRECT'}")
+            print(f"Response text: {response_text[-100:]}")
+            print(f"Extracted answer: {extracted_answer}")
+            print(f"Correct answer: {row['Answer']}")
+            print(f"Score: {score}")
+            print(f"Correct: {'CORRECT' if score == 1.0 else 'INCORRECT'}", end="")
+            if score == 1.0:
+                print("\033[92m ✓\033[0m")  # Green checkmark for correct
+            else:
+                print("\033[91m ✗\033[0m")  # Red X for incorrect
             logger.debug(f"Score: {score}")
             return score, content, response_text, extracted_answer
 
@@ -290,6 +447,7 @@ class MathEval:
                 self.examples.at[df_index, "response_text"] = response_text
                 self.examples.at[df_index, "extracted_answer"] = extracted_answer
                 # print(self.examples.head())
+                # import ipdb; ipdb.set_trace()
         logger.info(
             f"Evaluation complete. Average score: {sum(scores)/len(scores):.2f}"
         )
@@ -333,8 +491,19 @@ def main():
         action="store_true",
         help="Use OpenAI API for equality checking instead of grade_answer function",
     )
+    parser.add_argument(
+        "--beam-width", type=int, default=2, help="Beam width for beam search"
+    )
+    parser.add_argument(
+        "--num-generations", type=int, default=2, help="Number of generations per step"
+    )
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=40,
+        help="Maximum number of steps for beam search",
+    )
     args = parser.parse_args()
-
     policy_client_kwargs = {"api_key": args.policy_api_key}
     if args.policy_base_url:
         policy_client_kwargs["base_url"] = args.policy_base_url
@@ -370,15 +539,33 @@ def main():
         n_repeats=args.n_repeats,
     )
 
-    scores = math_eval(
-        lambda x: policy_client.chat.completions.create(
-            model=args.policy_model, messages=x
-        )
-        .choices[0]
-        .message.content
+    # # Using simple policy client
+    # simple_scores = math_eval(
+    #     lambda x: policy_client.chat.completions.create(
+    #         model=args.policy_model, messages=x
+    #     )
+    #     .choices[0]
+    #     .message.content
+    # )
+
+    # logger.info(f"Individual scores with simple policy client: {simple_scores}")
+
+    # Using beam search
+    process_guided_llm = ProcessGuidedLLM(
+        client=policy_client,
+        beam_width=args.beam_width,
+        model=args.policy_model,  # Add this line
     )
 
-    logger.info(f"Individual scores: {scores}")
+    beam_search_scores = math_eval(
+        lambda x: process_guided_llm(
+            prompt_messages=x,
+            num_generations=args.num_generations,
+            max_steps=args.max_steps,
+        )
+    )
+
+    logger.info(f"Individual scores with beam search: {beam_search_scores}")
 
 
 if __name__ == "__main__":

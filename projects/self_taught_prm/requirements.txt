@@ -8,3 +8,5 @@ fsspec
 huggingface-hub
 ruff
 pre-commit
+termcolor
+transformers

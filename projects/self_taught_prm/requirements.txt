@@ -10,3 +10,7 @@ ruff
 pre-commit
 termcolor
 transformers
+ipdb
+distilabel
+pynvml
+bitsandbytes

@@ -24,6 +24,8 @@ from termcolor import colored
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
+from prompt import LLAMA3_QUERY_TEMPLATE, STEP_VERIFICATION_PROMPT, EQUALITY_TEMPLATE
+
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -35,35 +37,6 @@ Solve the following math problem step by step. The last line of your response sh
 
 Remember to put your answer on its own line after "Answer:", and you do not need to use a \\boxed command.
 """.strip()
-
-# prompt from https://huggingface.co/datasets/meta-llama/Llama-3.1-405B-Instruct-evals
-LLAMA3_QUERY_TEMPLATE = jinja2.Template(
-    """
-Solve the following math problem efficiently and clearly:
-
-- For simple problems (2 steps or fewer):
-Provide a concise solution with minimal explanation.
-
-- For complex problems (3 steps or more):
-Use this step-by-step format:
-
-## Step 1: [Concise description]
-[Brief explanation and calculations]
-
-## Step 2: [Concise description]
-[Brief explanation and calculations]
-
-...
-
-Regardless of the approach, always conclude with:
-
-Therefore, the final answer is: $\\boxed{answer}$. I hope it is correct.
-
-Where [answer] is just the final number or expression that solves the problem.
-
-Problem: {{ Question }}
-""".strip()
-)
 
 
 ANSWER_PATTERN = r"(?i)Answer\s*:\s*([^\n]+)"  # for openai query prompt
@@ -101,86 +74,6 @@ def extract_result_from_boxed(answer: str) -> str:
         else:
             break
     return answer
-
-
-EQUALITY_TEMPLATE = r"""
-Look at the following two expressions (answers to a math problem) and judge whether they are equivalent. Only perform trivial simplifications
-
-Examples:
-
-    Expression 1: $2x+3$
-    Expression 2: $3+2x$
-
-Yes
-
-    Expression 1: 3/2
-    Expression 2: 1.5
-
-Yes
-
-    Expression 1: $x^2+2x+1$
-    Expression 2: $y^2+2y+1$
-
-No
-
-    Expression 1: $x^2+2x+1$
-    Expression 2: $(x+1)^2$
-
-Yes
-
-    Expression 1: 3245/5
-    Expression 2: 649
-
-No
-(these are actually equal, don't mark them equivalent if you need to do nontrivial simplifications)
-
-    Expression 1: 2/(-3)
-    Expression 2: -2/3
-
-Yes
-(trivial simplifications are allowed)
-
-    Expression 1: 72 degrees
-    Expression 2: 72
-
-Yes
-(give benefit of the doubt to units)
-
-    Expression 1: 64
-    Expression 2: 64 square feet
-
-Yes
-(give benefit of the doubt to units)
-
----
-
-YOUR TASK
-
-
-Respond with only "Yes" or "No" (without quotes). Do not include a rationale.
-
-    Expression 1: %(expression1)s
-    Expression 2: %(expression2)s
-""".strip()
-
-STEP_VERIFICATION_PROMPT = jinja2.Template(
-    textwrap.dedent(
-        """
-Given the problem and the partial solution, verify that the last step is correct.
-
-Problem: {{ Question }}
-
-Partial solution: {{ steps }}
-
-FIRST RESPOND with "Yes" if the last step is correct or benefits the progress towards the solution, "No" otherwise.
-THEN EXPLAIN why you chose "Yes" or "No" in 4 sentences or less.
-
-For example:
-"Yes, because ..."
-"No, because ..."
-""".strip()
-    )
-)
 
 
 def check_equality(
@@ -385,29 +278,29 @@ class MathEval:
                     .message.content
                 )
 
-            # for i, step in enumerate(steps):
-            #     verified_text = gpt4o_mini_sampler(row["Question"], "\n\n".join(steps[:i+1]))
-            #     if verified_text.strip().lower().startswith("yes"):
-            #         print(f"\033[92mStep: {step}\033[0m")  # Green for correct step
-            #         print(f"\033[92mStep verified response: {verified_text}\033[0m")
-            #         print("\033[92m✓ Correct\033[0m")
-            #     elif verified_text.strip().lower().startswith("no"):
-            #         print(f"\033[91mStep: {step}\033[0m")  # Red for incorrect step
-            #         print(f"\033[91mStep verified response: {verified_text}\033[0m")
-            #         print("\033[91m✗ Incorrect\033[0m")
-            #     else:
-            #         print(f"\033[93mStep: {step}\033[0m")  # Yellow for uncertain step
-            #         print(f"\033[93mStep verified response: {verified_text}\033[0m")
-            #         print("\033[93m? Uncertain\033[0m")
+            import ipdb
+
+            ipdb.set_trace()
+            for i, step in enumerate(steps):
+                verified_text = gpt4o_mini_sampler(row["Question"], "\n\n".join(steps[:i+1]))
+                if verified_text.strip().lower().startswith("yes"):
+                    print(f"\033[92mStep: {step}\033[0m")  # Green for correct step
+                    print(f"\033[92mStep verified response: {verified_text}\033[0m")
+                    print("\033[92m✓ Correct\033[0m")
+                elif verified_text.strip().lower().startswith("no"):
+                    print(f"\033[91mStep: {step}\033[0m")  # Red for incorrect step
+                    print(f"\033[91mStep verified response: {verified_text}\033[0m")
+                    print("\033[91m✗ Incorrect\033[0m")
+                else:
+                    print(f"\033[93mStep: {step}\033[0m")  # Yellow for uncertain step
+                    print(f"\033[93mStep verified response: {verified_text}\033[0m")
+                    print("\033[93m? Uncertain\033[0m")
             logger.debug(f"Problem response: {response_text}")
             # match = re.search(ANSWER_PATTERN, response_text)
             extracted_answer = extract_result_from_boxed(
                 response_text
             )  # TODO: this is a hack to get llama3 working
             logger.debug(f"Extracted answer: {extracted_answer}")
-            import ipdb
-
-            ipdb.set_trace()
             if self.equality_checker:
                 score = float(
                     check_equality(
